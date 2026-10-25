@@ -141,16 +141,24 @@ export function readsNumber(reply, expected) {
 }
 
 // ---------------------------------------------------------------------
-// Provider list. BayLeaf passes other /v1 paths through to OpenRouter, so
-// this asks OpenRouter which providers serve the model. If that lookup is
-// unavailable, the caller can name providers explicitly instead.
+// Provider list: asks OpenRouter which providers serve the model. BayLeaf
+// doesn't route /models/<slug>/endpoints (it answers 404), so on a 404 we
+// ask OpenRouter directly; that endpoint is public, so no key is sent.
+// If both fail, the caller can name providers explicitly instead.
 // ---------------------------------------------------------------------
+export const OPENROUTER_BASE_URL = 'https://openrouter.ai/api/v1';
+
 export async function listProviders({ model, baseUrl, apiKey }) {
     const slug = model.replace(/^openrouter:/, '');
-    const res = await fetch(`${baseUrl}/models/${slug}/endpoints`, {
+    let res = await fetch(`${baseUrl}/models/${slug}/endpoints`, {
         headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {},
         signal: AbortSignal.timeout(20000),
     });
+    if (res.status === 404) {
+        res = await fetch(`${OPENROUTER_BASE_URL}/models/${slug}/endpoints`, {
+            signal: AbortSignal.timeout(20000),
+        });
+    }
     if (!res.ok) {
         const err = new Error(`provider lookup returned HTTP ${res.status}`);
         err.status = res.status;
@@ -159,7 +167,10 @@ export async function listProviders({ model, baseUrl, apiKey }) {
     const data = (await res.json()).data ?? {};
     const endpoints = (data.endpoints ?? [])
         .filter((e) => e.tag && (e.status === undefined || e.status === 0))
-        .map((e) => ({ tag: e.tag, name: e.provider_name ?? e.tag, contextLength: e.context_length }));
+        .map((e) => ({
+            tag: e.tag, name: e.provider_name ?? e.tag,
+            contextLength: e.context_length, maxOutput: e.max_completion_tokens,
+        }));
     return {
         endpoints,
         acceptsImages: data.architecture?.input_modalities?.includes('image'),
@@ -178,7 +189,9 @@ async function attempt({ model, provider, baseUrl, apiKey }) {
     const body = {
         model,
         temperature: 0,
-        max_tokens: 400, // leaves room for models that reason before answering
+        // Reasoning models spend hidden tokens thinking before they answer, and
+        // those count against max_tokens. Too small a budget gives an empty reply.
+        max_tokens: 4000,
         messages: [{
             role: 'user',
             content: [
@@ -229,6 +242,7 @@ async function attempt({ model, provider, baseUrl, apiKey }) {
     return {
         ...result,
         reply: String(reply).trim().slice(0, 200),
+        finishReason: json.choices?.[0]?.finish_reason,
         servedBy: json.provider, // OpenRouter names the provider that answered, when passed through
         ok: readsNumber(reply, expected),
         retryable: true, // a misread may be a fluke; try a new number
@@ -305,7 +319,7 @@ export async function checkVision({
                 else report.routingIgnored = true;
             }
             log(`[${cand.tag ?? 'default'}]   ${a.ok ? 'PASS' : 'fail'}: sent ${a.expected}, ` +
-                (a.error ? a.error : `got "${a.reply}"`) + (a.servedBy ? ` (served by ${a.servedBy})` : ''));
+                (a.error ? a.error : `got "${a.reply}"` + (!a.reply && a.finishReason ? ` [finish_reason: ${a.finishReason}]` : '')) + (a.servedBy ? ` (served by ${a.servedBy})` : ''));
             if (a.fatal) {
                 report.fatal = a.status === 401
                     ? 'The API key was rejected (HTTP 401). Check BAYLEAF_API_KEY, or connect to the UCSC network to use Campus Pass.'
@@ -370,12 +384,18 @@ export function formatReport(report) {
     // pinned, that's the pinned providers; with default routing, OpenRouter
     // may pick any provider of the model. Overstating it lets a long session
     // grow past what the serving provider accepts.
-    const usable = (report.endpoints ?? [])
-        .filter((e) => !recommendPin || pinned.includes(e.tag))
-        .map((e) => e.contextLength)
-        .filter((n) => Number.isFinite(n) && n > 0);
-    const knownCtx = usable.length ? Math.min(...usable) : undefined;
+    const reachable = (report.endpoints ?? []).filter((e) => !recommendPin || pinned.includes(e.tag));
+    const smallest = (key) => {
+        const ns = reachable.map((e) => e[key]).filter((n) => Number.isFinite(n) && n > 0);
+        return ns.length ? Math.min(...ns) : undefined;
+    };
+    const knownCtx = smallest('contextLength');
     const ctx = knownCtx ?? 32000;
+    // Max output tokens: the same rule, using each provider's output limit,
+    // capped at 32000 (plenty for reasoning plus a sketch) and at half the
+    // context window, since input and output share it.
+    const knownMaxOut = smallest('maxOutput');
+    const maxTokens = knownMaxOut ? Math.min(32000, knownMaxOut, Math.floor(ctx / 2)) : 8000;
     lines.push('', 'Crush setup for this model (in your crushrc):', '');
     const providerLine = [
         'provider add bayleaf --name BayLeaf --type openai-compat \\',
@@ -388,11 +408,14 @@ export function formatReport(report) {
     }
     lines.push(...providerLine, '',
         `model add bayleaf/${modelId} --name "${modelId.replace(/^openrouter:/, '')}" \\`,
-        `  --context-window ${ctx} --default-max-tokens 8000 --supports-images true`,
+        `  --context-window ${ctx} --default-max-tokens ${maxTokens} --supports-images true`,
         '',
         `model large bayleaf/${modelId}`);
     if (!knownCtx) {
         lines.push('', 'The context window (32000 above) is a safe guess; replace it with the number on the model\'s page.');
+    }
+    if (!knownMaxOut) {
+        lines.push('', 'The max tokens (8000 above) is a safe guess; providers didn\'t report their output limits.');
     }
     if (defaultPassed && report.rounds.length === 1) {
         lines.push('', 'Default routing can send requests to any provider of this model. If renders ever come back ' +
