@@ -1,10 +1,9 @@
 // =====================================================================
-// server.js — the p5 Studio MCP server. THIS IS THE FILE YOU WRITE.
+// server.js — the p5 Studio MCP server.
 //
-// The hard rendering work lives in render.js (provided). Your job is to
-// expose it to the agent as well-described MCP tools. The tool
-// description is the agent's only manual: anything it doesn't say, the
-// agent doesn't know.
+// This is the part you write. The hard rendering work lives in render.js
+// (provided); your job is to expose it to the agent as well-described
+// MCP tools. Remember: the tool description is the agent's only manual.
 //
 // Reminder from the MCP assignment: stdout belongs to MCP.
 // Log with console.error, never console.log.
@@ -20,8 +19,16 @@ const server = new McpServer({ name: 'p5-studio', version: '1.0.0' });
 // Provided: check_vision and vision_selftest (see vision.js). Leave this in.
 registerVisionTools(server);
 
+const SKETCH_RULES =
+    `Sketches are p5.js 2.x files in the sketches/ folder, named like sketches/drift.js, ` +
+    `and referred to by name without ".js" (e.g. "drift"). Each must call ` +
+    `createCanvas(${DISPLAY.size}, ${DISPLAY.size}) in setup(). Renders are shown through a ` +
+    `circular mask, previewing a round display, so keep important content inside the circle. ` +
+    `Randomness is seeded automatically: random(), noise(), and Math.random() all repeat ` +
+    `exactly for the same seed, so never call randomSeed() or noiseSeed() yourself.`;
+
 // ---------------------------------------------------------------------
-// Tool 1: list_sketches — DONE, as a worked example.
+// Tool 1: list_sketches
 // ---------------------------------------------------------------------
 server.registerTool(
     'list_sketches',
@@ -41,59 +48,85 @@ server.registerTool(
 );
 
 // ---------------------------------------------------------------------
-// Tool 2: render_sketch — TODO
-//
-// Inputs:  sketch (string), seed (integer, default 1),
-//          frames (integer, default 1: how many frames of draw() to run)
-//
-// Call:    const r = await renderSketch({ sketch, seed, frames });
-//
-// r.png       a Buffer holding the PNG, or null if no canvas was made
-// r.errors    array of error messages from the sketch
-// r.warnings  array of warning messages
-// r.timedOut  true if the sketch never finished
-// r.ms        render time in milliseconds
-// r.savedTo   where the PNG was saved, e.g. "renders/drift/seed_000001.png"
-//
-// problemReport([r]) turns errors/warnings/timeouts into readable text.
-//
-// Return BOTH a text block (what happened, where it was saved, any
-// problems) AND an image block:
-//     { type: 'image', data: r.png.toString('base64'), mimeType: 'image/png' }
-// Set isError: true when r.errors is not empty. Wrap everything in
-// try/catch: renderSketch throws for unknown or invalid sketch names.
-//
-// The description matters most. The agent needs to know: where sketches
-// live and how they're named, that the canvas must be
-// DISPLAY.size x DISPLAY.size, that renders are shown in a circle, that
-// seeding is automatic (so it must NOT call randomSeed/noiseSeed), and
-// when to raise frames.
+// Tool 2: render_sketch — one seed, one image
 // ---------------------------------------------------------------------
-
+server.registerTool(
+    'render_sketch',
+    {
+        description:
+            'Render a p5.js sketch at one seed and return the image so you can see it. ' +
+            'Any errors the sketch throws are reported in the reply; fix them before judging the image. ' +
+            'For sketches that build up over time (trails, growth, accumulation), raise frames: ' +
+            'the image is captured after that many frames of draw(). ' + SKETCH_RULES,
+        inputSchema: z.object({
+            sketch: z.string().describe('Sketch name, e.g. "drift" for sketches/drift.js'),
+            seed: z.number().int().min(0).default(1).describe('Random seed; the same seed always gives the same image'),
+            frames: z.number().int().min(1).max(600).default(1)
+                .describe('How many frames of draw() to run before capturing (about 60 per second)'),
+        }),
+    },
+    async ({ sketch, seed, frames }) => {
+        try {
+            const r = await renderSketch({ sketch, seed, frames });
+            const problems = problemReport([r]);
+            const summary =
+                `Rendered "${sketch}" seed ${seed}, ${frames} frame(s), in ${r.ms} ms.` +
+                (r.savedTo ? ` Saved ${r.savedTo}.` : '') +
+                (problems ? `\nProblems:\n${problems}` : '\nNo errors.');
+            const content = [{ type: 'text', text: summary }];
+            if (r.png) {
+                content.push({ type: 'image', data: r.png.toString('base64'), mimeType: 'image/png' });
+            }
+            // A blank canvas from a crashed sketch is still a failure.
+            return { content, isError: !r.png || r.errors.length > 0 };
+        } catch (err) {
+            return { content: [{ type: 'text', text: `Error: ${err.message}` }], isError: true };
+        }
+    }
+);
 
 // ---------------------------------------------------------------------
-// Tool 3: contact_sheet — TODO
-//
-// Inputs:  sketch, count (how many seeds, default 9), frames (default 1)
-//
-// Call:    const seeds = DEFAULT_SEEDS.slice(0, count);   // same seeds every time
-//          const sheet = await contactSheet({ sketch, seeds, frames });
-//
-// sheet.png      a Buffer holding the grid image
-// sheet.results  an array of per-seed results, shaped like r above
-// sheet.savedTo  where the grid was saved
-// sheet.ms       total time in milliseconds
-//
-// Return a text summary (use problemReport(sheet.results)) and the image.
-// List the seeds in the summary, so the agent can render any one of them
-// at full size with render_sketch.
-//
-// In the description, tell the agent WHY this tool exists: a generative
-// artwork is the algorithm, not one output, so the agent should judge a
-// sketch by what stays consistent across seeds. Nudge it to prefer this
-// tool over render_sketch when evaluating a design.
+// Tool 3: contact_sheet — many seeds, one grid
 // ---------------------------------------------------------------------
-
+server.registerTool(
+    'contact_sheet',
+    {
+        description:
+            'Render a p5.js sketch at several seeds and return one grid image of all of them. ' +
+            'Use this to judge a generative sketch as a whole: the artwork is the algorithm, not any ' +
+            'single output, so look at what stays consistent and what varies across seeds. ' +
+            'Prefer this over render_sketch when evaluating a design. Every sheet uses the same seeds, ' +
+            'so sheets of two versions of a sketch compare directly. ' + SKETCH_RULES,
+        inputSchema: z.object({
+            sketch: z.string().describe('Sketch name, e.g. "drift" for sketches/drift.js'),
+            count: z.number().int().min(2).max(DEFAULT_SEEDS.length).default(9)
+                .describe('Number of seeds to render; always the same seeds, in the same order'),
+            frames: z.number().int().min(1).max(600).default(1)
+                .describe('How many frames of draw() to run before capturing each seed'),
+        }),
+    },
+    async ({ sketch, count, frames }) => {
+        try {
+            const seeds = DEFAULT_SEEDS.slice(0, count);
+            const sheet = await contactSheet({ sketch, seeds, frames });
+            const problems = problemReport(sheet.results);
+            const summary =
+                `Contact sheet for "${sketch}", ${seeds.length} seeds, ${frames} frame(s) each, ` +
+                `in ${sheet.ms} ms. Saved ${sheet.savedTo}.\nSeeds, left to right and top to bottom: ` +
+                `${seeds.join(', ')}. To see one at full size, use render_sketch with that seed.` +
+                (problems ? `\nProblems:\n${problems}` : '\nNo errors.');
+            return {
+                content: [
+                    { type: 'text', text: summary },
+                    { type: 'image', data: sheet.png.toString('base64'), mimeType: 'image/png' },
+                ],
+                isError: sheet.results.some((r) => !r.png || r.errors.length > 0),
+            };
+        } catch (err) {
+            return { content: [{ type: 'text', text: `Error: ${err.message}` }], isError: true };
+        }
+    }
+);
 
 async function main() {
     const transport = new StdioServerTransport();
